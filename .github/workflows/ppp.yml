@@ -1,4 +1,4 @@
-name: Build R36S Kernel - Network WiFi Ethernet USB
+name: Build R36S Kernel - Wired Ethernet USB (No Wireless)
 
 on:
   workflow_dispatch:
@@ -53,6 +53,7 @@ jobs:
             echo "fs/exfat is missing; restoring compatible exFAT driver."
 
             rm -rf /tmp/linux-exfat-oot
+
             git clone \
               --depth=1 \
               --single-branch \
@@ -74,22 +75,64 @@ jobs:
           set -e
           make ARCH=arm64 lineageos_r36s_defconfig
 
-      - name: Enable compatible network and USB drivers
+      - name: Disable all wireless and Wi-Fi drivers
         working-directory: kernel
         run: |
           set -e
 
-          : > network-usb.config
+          : > no-wireless.config
 
-          # Enable driver Kconfig symbols in the network areas that contain
-          # Wi-Fi, USB Ethernet and normal Ethernet MAC drivers.
-          #
-          # Do NOT force drivers/net/phy or drivers/net/dsa. Those directories
-          # contain many optional PHY/switch drivers which are not required by
-          # the R36S and some are not compatible with this vendor 4.19 tree.
+          if [ -d drivers/net/wireless ]; then
+            find drivers/net/wireless \
+              -type f \
+              \( -name 'Kconfig' -o -name 'Kconfig.*' \) \
+              -print0 |
+            while IFS= read -r -d '' kconfig; do
+              grep -hE \
+                '^[[:space:]]*config[[:space:]]+[A-Za-z0-9_]+' \
+                "$kconfig" || true
+            done |
+            sed -E \
+              's/^[[:space:]]*config[[:space:]]+//' |
+            sed -E \
+              's/[[:space:]].*$//' |
+            sort -u |
+            while IFS= read -r symbol; do
+              [ -n "$symbol" ] || continue
+              printf 'CONFIG_%s=n\n' "$symbol"
+            done >> no-wireless.config
+          fi
+
+          cat >> no-wireless.config <<'EOF'
+          CONFIG_WIRELESS=n
+          CONFIG_WLAN=n
+          CONFIG_CFG80211=n
+          CONFIG_MAC80211=n
+          CONFIG_USB_NET_RNDIS_WLAN=n
+          CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP=n
+          EOF
+
+          sort -u no-wireless.config -o no-wireless.config
+
+          ./scripts/kconfig/merge_config.sh \
+            -m \
+            .config \
+            no-wireless.config
+
+          make ARCH=arm64 olddefconfig
+
+      - name: Enable wired Ethernet and USB drivers
+        working-directory: kernel
+        run: |
+          set -e
+
+          : > wired-usb.config
+
+          # Intentionally excludes drivers/net/wireless and all Wi-Fi
+          # vendor trees. Only wired Ethernet MAC drivers, USB drivers,
+          # and USB Ethernet/network drivers are included here.
           for dir in \
             drivers/net/ethernet \
-            drivers/net/wireless \
             drivers/net/usb \
             drivers/usb
           do
@@ -112,28 +155,28 @@ jobs:
             while IFS= read -r symbol; do
               [ -n "$symbol" ] || continue
               printf 'CONFIG_%s=y\n' "$symbol"
-            done >> network-usb.config
+            done >> wired-usb.config
           done
 
-          cat >> network-usb.config <<'EOF'
-
-          # Networking core
+          # Core wired networking.
+          cat >> wired-usb.config <<'EOF'
           CONFIG_NET=y
           CONFIG_PACKET=y
           CONFIG_UNIX=y
           CONFIG_INET=y
           CONFIG_NETDEVICES=y
           CONFIG_ETHERNET=y
-          CONFIG_WIRELESS=y
-          CONFIG_WLAN=y
-          CONFIG_CFG80211=y
-          CONFIG_MAC80211=y
+          CONFIG_OF_NET=y
+          CONFIG_OF_MDIO=y
+          CONFIG_MDIO_DEVICE=y
+          CONFIG_MDIO_BUS=y
+          CONFIG_PHYLIB=y
 
-          # USB core
+          # USB core.
           CONFIG_USB_SUPPORT=y
           CONFIG_USB=y
 
-          # USB networking
+          # USB networking.
           CONFIG_USB_NET_DRIVERS=y
           CONFIG_USB_USBNET=y
           CONFIG_USB_NET_CDCETHER=y
@@ -141,9 +184,8 @@ jobs:
           CONFIG_USB_NET_CDC_NCM=y
           CONFIG_USB_NET_RNDIS_HOST=y
           CONFIG_USB_NET_CDC_SUBSET=y
-          CONFIG_USB_NET_RNDIS_WLAN=y
 
-          # PPP / PPTP
+          # PPP / PPTP.
           CONFIG_PPP=y
           CONFIG_PPP_BSDCOMP=y
           CONFIG_PPP_DEFLATE=y
@@ -156,20 +198,35 @@ jobs:
           CONFIG_PPP_ASYNC=y
           CONFIG_PPP_SYNC_TTY=y
 
-          # exFAT
+          # exFAT.
           CONFIG_EXFAT_FS=y
           CONFIG_EXFAT_DEFAULT_IOCHARSET="utf8"
-
-          # Known optional TI PHY not needed on R36S.
-          # The R36S base defconfig keeps PHY selection compatible with its MAC.
-          CONFIG_DP83867_PHY=n
           EOF
 
-          sort -u network-usb.config -o network-usb.config
+          # Never allow a wireless symbol to be re-enabled by the broad
+          # Ethernet/USB sweep.
+          if [ -f no-wireless.config ]; then
+            while IFS= read -r line; do
+              case "$line" in
+                CONFIG_*=n)
+                  symbol="${line%%=n}"
+                  sed -i "/^${symbol}=y$/d" wired-usb.config
+                  sed -i "/^${symbol}=m$/d" wired-usb.config
+                  ;;
+              esac
+            done < no-wireless.config
+          fi
 
-          echo "Generated $(wc -l < network-usb.config) configuration entries."
+          sort -u wired-usb.config -o wired-usb.config
 
-      - name: Merge network and USB configuration
+          ./scripts/kconfig/merge_config.sh \
+            -m \
+            .config \
+            wired-usb.config
+
+          make ARCH=arm64 olddefconfig
+
+      - name: Re-disable wireless after dependency resolution
         working-directory: kernel
         run: |
           set -e
@@ -177,29 +234,73 @@ jobs:
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
-            network-usb.config
+            no-wireless.config
 
           make ARCH=arm64 olddefconfig
 
-      - name: Show final important configuration
+      - name: Verify no wireless drivers are enabled
         working-directory: kernel
         run: |
-          echo "========================================"
-          echo "NETWORK / WIFI / ETHERNET / USB"
-          echo "========================================"
+          set -e
 
-          grep -E \
-            '^CONFIG_(NET|NETDEVICES|ETHERNET|WIRELESS|WLAN|CFG80211|MAC80211|USB_NET|USB_USBNET|PPP|PPPOE|PPTP|PPPOL2TP)' \
-            .config || true
+          failed=0
+
+          echo "Checking wireless configuration..."
+
+          for symbol in \
+            CONFIG_WIRELESS \
+            CONFIG_WLAN \
+            CONFIG_CFG80211 \
+            CONFIG_MAC80211 \
+            CONFIG_USB_NET_RNDIS_WLAN \
+            CONFIG_WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP
+          do
+            if grep -qx "${symbol}=y" .config || \
+               grep -qx "${symbol}=m" .config; then
+              echo "WIRELESS ENABLED: ${symbol}"
+              failed=1
+            else
+              echo "OK: ${symbol} disabled"
+            fi
+          done
+
+          if [ -d drivers/net/wireless ]; then
+            while IFS= read -r symbol; do
+              [ -n "$symbol" ] || continue
+
+              if grep -qx "CONFIG_${symbol}=y" .config || \
+                 grep -qx "CONFIG_${symbol}=m" .config; then
+                echo "WIRELESS DRIVER ENABLED: CONFIG_${symbol}"
+                failed=1
+              fi
+            done < <(
+              find drivers/net/wireless \
+                -type f \
+                \( -name 'Kconfig' -o -name 'Kconfig.*' \) \
+                -print0 |
+              while IFS= read -r -d '' kconfig; do
+                grep -hE \
+                  '^[[:space:]]*config[[:space:]]+[A-Za-z0-9_]+' \
+                  "$kconfig" || true
+              done |
+              sed -E \
+                's/^[[:space:]]*config[[:space:]]+//' |
+              sed -E \
+                's/[[:space:]].*$//' |
+              sort -u
+            )
+          fi
+
+          if [ "$failed" -ne 0 ]; then
+            echo
+            echo "ERROR: at least one wireless/Wi-Fi option is enabled."
+            exit 1
+          fi
 
           echo
-          echo "========================================"
-          echo "EXFAT"
-          echo "========================================"
+          echo "All wireless/Wi-Fi drivers are disabled."
 
-          grep -E '^CONFIG_EXFAT_' .config || true
-
-      - name: Verify required options
+      - name: Verify required wired networking options
         working-directory: kernel
         run: |
           set -e
@@ -208,9 +309,6 @@ jobs:
             CONFIG_NET
             CONFIG_NETDEVICES
             CONFIG_ETHERNET
-            CONFIG_WIRELESS
-            CONFIG_CFG80211
-            CONFIG_MAC80211
             CONFIG_USB_SUPPORT
             CONFIG_USB
             CONFIG_USB_NET_DRIVERS
@@ -246,6 +344,33 @@ jobs:
             exit 1
           fi
 
+      - name: Show final important configuration
+        working-directory: kernel
+        run: |
+          echo "========================================"
+          echo "WIRED ETHERNET / USB / PPP"
+          echo "========================================"
+
+          grep -E \
+            '^CONFIG_(NET|NETDEVICES|ETHERNET|MDIO|PHY|USB_NET|USB_USBNET|PPP|PPPOE|PPTP|PPPOL2TP)' \
+            .config || true
+
+          echo
+          echo "========================================"
+          echo "WIRELESS"
+          echo "========================================"
+
+          grep -E \
+            '^CONFIG_(WIRELESS|WLAN|CFG80211|MAC80211|USB_NET_RNDIS_WLAN|WIFI_LOAD_DRIVER_WHEN_KERNEL_BOOTUP)=' \
+            .config || true
+
+          echo
+          echo "========================================"
+          echo "EXFAT"
+          echo "========================================"
+
+          grep -E '^CONFIG_EXFAT_' .config || true
+
       - name: Build ARM64 kernel Image
         working-directory: kernel
         run: |
@@ -269,24 +394,29 @@ jobs:
           cp kernel/.config \
             output/r36s.config
 
-          cp kernel/network-usb.config \
-            output/network-usb.config
+          cp kernel/wired-usb.config \
+            output/wired-usb.config
+
+          cp kernel/no-wireless.config \
+            output/no-wireless.config
 
           cd output
 
           zip -9 \
-            ../r36s-kernel-network-usb.zip \
+            ../r36s-kernel-wired-ethernet-usb.zip \
             Image \
             r36s.config \
-            network-usb.config
+            wired-usb.config \
+            no-wireless.config
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: r36s-kernel-network-usb
+          name: r36s-kernel-wired-ethernet-usb
           path: |
             output/Image
             output/r36s.config
-            output/network-usb.config
-            r36s-kernel-network-usb.zip
+            output/wired-usb.config
+            output/no-wireless.config
+            r36s-kernel-wired-ethernet-usb.zip
           if-no-files-found: error
