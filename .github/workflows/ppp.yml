@@ -37,64 +37,49 @@ jobs:
 
       - name: Clone R36S kernel
         run: |
+          set -e
           git clone \
             --depth=1 \
             --branch lineage-18.1 \
             https://github.com/andr36oid/android_kernel_gameconsole_r36s.git \
             kernel
 
-      - name: Locate R36S defconfig
+      - name: Restore missing exFAT driver
         working-directory: kernel
         run: |
           set -e
 
-          DEFCONFIG=""
+          # The R36S kernel's fs/Kconfig and fs/Makefile reference
+          # fs/exfat, but the directory is missing from the repository.
+          #
+          # Use the exFAT backport branch intended for older kernels.
+          if [ ! -f fs/exfat/Kconfig ]; then
+            echo "fs/exfat is missing; restoring a 4.1-5.15 compatible exFAT driver."
 
-          for name in \
-            lineageos_r36s_defconfig \
-            lineage_r36s_defconfig \
-            r36s_defconfig \
-            gameconsole_r36s_defconfig
-          do
-            if [ -f "arch/arm64/configs/$name" ]; then
-              DEFCONFIG="$name"
-              break
-            fi
-          done
+            rm -rf /tmp/linux-exfat-oot
+            git clone \
+              --depth=1 \
+              --single-branch \
+              --branch for-kernel-version-from-4.1.0 \
+              https://github.com/namjaejeon/linux-exfat-oot.git \
+              /tmp/linux-exfat-oot
 
-          if [ -z "$DEFCONFIG" ]; then
-            for file in arch/arm64/configs/*defconfig; do
-              [ -f "$file" ] || continue
+            mkdir -p fs/exfat
+            cp -a /tmp/linux-exfat-oot/. fs/exfat/
 
-              if grep -q '^CONFIG_WL_ROCKCHIP=y' "$file" && \
-                 grep -q '^CONFIG_PPP=y' "$file" && \
-                 grep -q '^CONFIG_PPTP=y' "$file"; then
-                DEFCONFIG="$(basename "$file")"
-                break
-              fi
-            done
+            rm -rf fs/exfat/.git
           fi
 
-          if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: Could not find the R36S defconfig."
-            echo
-            echo "Available ARM64 defconfigs:"
-            find arch/arm64/configs \
-              -maxdepth 1 \
-              -type f \
-              -name '*defconfig' \
-              -printf '%f\n' | sort
-            exit 1
-          fi
+          test -f fs/exfat/Kconfig
+          test -f fs/exfat/Makefile
 
-          echo "Using defconfig: $DEFCONFIG"
-          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+          echo "exFAT driver restored successfully."
 
-      - name: Load base defconfig
+      - name: Load R36S defconfig
         working-directory: kernel
         run: |
           set -e
-          make ARCH=arm64 "$DEFCONFIG"
+          make ARCH=arm64 lineageos_r36s_defconfig
 
       - name: Create all network and USB driver configuration
         working-directory: kernel
@@ -139,8 +124,22 @@ jobs:
           CONFIG_NETDEVICES=y
           CONFIG_ETHERNET=y
           CONFIG_WIRELESS=y
+          CONFIG_WLAN=y
           CONFIG_CFG80211=y
           CONFIG_MAC80211=y
+          CONFIG_OF_NET=y
+          CONFIG_OF_MDIO=y
+          CONFIG_MDIO_DEVICE=y
+          CONFIG_MDIO_BUS=y
+          CONFIG_PHYLINK=y
+          CONFIG_PHYLIB=y
+
+          # USB core
+          CONFIG_USB_SUPPORT=y
+          CONFIG_USB=y
+          CONFIG_USB_COMMON=y
+          CONFIG_USB_PHY=y
+          CONFIG_USB_GADGET=y
 
           # USB networking
           CONFIG_USB_NET_DRIVERS=y
@@ -149,6 +148,7 @@ jobs:
           CONFIG_USB_NET_CDC_EEM=y
           CONFIG_USB_NET_CDC_NCM=y
           CONFIG_USB_NET_RNDIS_HOST=y
+          CONFIG_USB_NET_CDC_SUBSET_ENABLE=y
           CONFIG_USB_NET_CDC_SUBSET=y
           CONFIG_USB_NET_RNDIS_WLAN=y
 
@@ -164,14 +164,17 @@ jobs:
           CONFIG_PPPOL2TP=y
           CONFIG_PPP_ASYNC=y
           CONFIG_PPP_SYNC_TTY=y
+
+          # exFAT
+          CONFIG_EXFAT_FS=y
+          CONFIG_EXFAT_DEFAULT_IOCHARSET="utf8"
           EOF
 
           sort -u \
             all-network-usb.config \
             -o all-network-usb.config
 
-          echo "Generated configuration entries:"
-          wc -l all-network-usb.config
+          echo "Generated $(wc -l < all-network-usb.config) configuration entries."
 
       - name: Merge network and USB configuration
         working-directory: kernel
@@ -193,7 +196,7 @@ jobs:
           echo "========================================"
 
           grep -E \
-            '^CONFIG_(NET|NETDEVICES|ETHERNET|PHY|WIRELESS|WLAN|CFG80211|MAC80211|PPP|PPPOE|PPTP|PPPOL2TP|USB_NET|USB_USBNET)' \
+            '^CONFIG_(NET|NETDEVICES|ETHERNET|MDIO|PHY|WIRELESS|WLAN|CFG80211|MAC80211|PPP|PPPOE|PPTP|PPPOL2TP|USB_NET|USB_USBNET)' \
             .config || true
 
           echo
@@ -202,6 +205,13 @@ jobs:
           echo "========================================"
 
           grep -E '^CONFIG_USB_' .config || true
+
+          echo
+          echo "========================================"
+          echo "EXFAT"
+          echo "========================================"
+
+          grep -E '^CONFIG_EXFAT_' .config || true
 
       - name: Verify required options
         working-directory: kernel
@@ -213,9 +223,11 @@ jobs:
             CONFIG_NETDEVICES
             CONFIG_ETHERNET
             CONFIG_WIRELESS
+            CONFIG_WLAN
             CONFIG_CFG80211
             CONFIG_MAC80211
             CONFIG_USB_SUPPORT
+            CONFIG_USB
             CONFIG_USB_NET_DRIVERS
             CONFIG_USB_USBNET
             CONFIG_PPP
@@ -229,6 +241,7 @@ jobs:
             CONFIG_PPPOL2TP
             CONFIG_PPP_ASYNC
             CONFIG_PPP_SYNC_TTY
+            CONFIG_EXFAT_FS
           )
 
           failed=0
