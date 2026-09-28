@@ -1,0 +1,220 @@
+```yaml
+name: Build R36S Kernel - PPP/PPTP
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  build:
+    name: Build R36S Kernel
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            ccache \
+            flex \
+            gcc-aarch64-linux-gnu \
+            git \
+            libssl-dev \
+            libelf-dev \
+            libncurses5-dev \
+            python3 \
+            rsync \
+            unzip \
+            wget \
+            xz-utils
+
+      - name: Clone R36S kernel
+        run: |
+          git clone \
+            --depth=1 \
+            --branch lineage-18.1 \
+            https://github.com/andr36oid/android_kernel_gameconsole_r36s.git \
+            kernel
+
+      - name: Show kernel information
+        working-directory: kernel
+        run: |
+          git log -1 --oneline
+          echo "Kernel source:"
+          pwd
+          echo
+          echo "Available ARM64 defconfigs:"
+          find arch/arm64/configs -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Find R36S defconfig
+        working-directory: kernel
+        run: |
+          set -e
+
+          DEFCONFIG=""
+
+          for config in \
+            lineageos_r36s_defconfig \
+            lineage_r36s_defconfig \
+            r36s_defconfig \
+            gameconsole_r36s_defconfig
+          do
+            if [ -f "arch/arm64/configs/$config" ]; then
+              DEFCONFIG="$config"
+              break
+            fi
+          done
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "ERROR: Could not automatically find the R36S defconfig."
+            echo
+            echo "Available configs:"
+            find arch/arm64/configs -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+
+          echo "Using defconfig: $DEFCONFIG"
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+
+      - name: Create PPP/PPTP configuration fragment
+        working-directory: kernel
+        run: |
+          cat > r36s-ppp.config <<'EOF'
+          #
+          # R36S PPP / PPTP support
+          #
+
+          CONFIG_PPP=y
+          CONFIG_PPP_BSDCOMP=y
+          CONFIG_PPP_DEFLATE=y
+          CONFIG_PPP_FILTER=y
+          CONFIG_PPP_MPPE=y
+          CONFIG_PPP_MULTILINK=y
+          CONFIG_PPPOE=y
+          CONFIG_PPTP=y
+          CONFIG_PPPOL2TP=y
+          CONFIG_PPP_ASYNC=y
+          CONFIG_PPP_SYNC_TTY=y
+          EOF
+
+          cat r36s-ppp.config
+
+      - name: Generate base kernel configuration
+        working-directory: kernel
+        run: |
+          make ARCH=arm64 "$DEFCONFIG"
+
+      - name: Apply PPP/PPTP configuration
+        working-directory: kernel
+        run: |
+          ./scripts/kconfig/merge_config.sh \
+            -m \
+            .config \
+            r36s-ppp.config
+
+          echo
+          echo "Regenerating configuration..."
+          make ARCH=arm64 olddefconfig
+
+      - name: Verify PPP/PPTP configuration
+        working-directory: kernel
+        run: |
+          set -e
+
+          echo "Checking final .config..."
+          echo
+
+          REQUIRED_CONFIGS="
+          CONFIG_PPP=y
+          CONFIG_PPP_BSDCOMP=y
+          CONFIG_PPP_DEFLATE=y
+          CONFIG_PPP_FILTER=y
+          CONFIG_PPP_MPPE=y
+          CONFIG_PPP_MULTILINK=y
+          CONFIG_PPPOE=y
+          CONFIG_PPTP=y
+          CONFIG_PPPOL2TP=y
+          CONFIG_PPP_ASYNC=y
+          CONFIG_PPP_SYNC_TTY=y
+          "
+
+          FAILED=0
+
+          while IFS= read -r CONFIG; do
+            [ -z "$CONFIG" ] && continue
+
+            if grep -qx "$CONFIG" .config; then
+              echo "OK: $CONFIG"
+            else
+              echo "FAILED: $CONFIG"
+              FAILED=1
+            fi
+          done <<< "$REQUIRED_CONFIGS"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo
+            echo "One or more requested kernel options were not enabled."
+            echo
+            grep -E '^CONFIG_(PPP|PPPOE|PPTP|PPPOL2TP)' .config || true
+            exit 1
+          fi
+
+          echo
+          echo "All requested PPP/PPTP options are enabled."
+
+      - name: Build kernel
+        working-directory: kernel
+        run: |
+          make \
+            -j"$(nproc)" \
+            ARCH=arm64 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            Image
+
+      - name: Collect build output
+        run: |
+          mkdir -p output
+
+          cp kernel/arch/arm64/boot/Image \
+            output/Image
+
+          cp kernel/.config \
+            output/r36s.config
+
+          cp kernel/r36s-ppp.config \
+            output/r36s-ppp.config
+
+          echo "Build completed:"
+          ls -lh output/
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: r36s-kernel-ppp-pptp
+          path: output/
+          if-no-files-found: error
+
+      - name: Create release package
+        run: |
+          cd output
+          zip -9 ../r36s-kernel-ppp-pptp.zip \
+            Image \
+            r36s.config \
+            r36s-ppp.config
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: r36s-kernel-ppp-pptp-zip
+          path: r36s-kernel-ppp-pptp.zip
+          if-no-files-found: error
+```
