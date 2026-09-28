@@ -1,5 +1,4 @@
-```yaml
-name: Build R36S Kernel - PPP/PPTP
+name: Build R36S Kernel - All Network USB Drivers
 
 on:
   workflow_dispatch:
@@ -24,13 +23,12 @@ jobs:
             bc \
             bison \
             build-essential \
-            ccache \
             flex \
             gcc-aarch64-linux-gnu \
             git \
-            libssl-dev \
             libelf-dev \
             libncurses5-dev \
+            libssl-dev \
             python3 \
             rsync \
             unzip \
@@ -45,54 +43,116 @@ jobs:
             https://github.com/andr36oid/android_kernel_gameconsole_r36s.git \
             kernel
 
-      - name: Show kernel information
-        working-directory: kernel
-        run: |
-          git log -1 --oneline
-          echo "Kernel source:"
-          pwd
-          echo
-          echo "Available ARM64 defconfigs:"
-          find arch/arm64/configs -maxdepth 1 -type f -printf '%f\n' | sort
-
-      - name: Find R36S defconfig
+      - name: Locate R36S defconfig
         working-directory: kernel
         run: |
           set -e
 
           DEFCONFIG=""
 
-          for config in \
+          for name in \
             lineageos_r36s_defconfig \
             lineage_r36s_defconfig \
             r36s_defconfig \
             gameconsole_r36s_defconfig
           do
-            if [ -f "arch/arm64/configs/$config" ]; then
-              DEFCONFIG="$config"
+            if [ -f "arch/arm64/configs/$name" ]; then
+              DEFCONFIG="$name"
               break
             fi
           done
 
           if [ -z "$DEFCONFIG" ]; then
-            echo "ERROR: Could not automatically find the R36S defconfig."
+            for file in arch/arm64/configs/*defconfig; do
+              [ -f "$file" ] || continue
+
+              if grep -q '^CONFIG_WL_ROCKCHIP=y' "$file" && \
+                 grep -q '^CONFIG_PPP=y' "$file" && \
+                 grep -q '^CONFIG_PPTP=y' "$file"; then
+                DEFCONFIG="$(basename "$file")"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "ERROR: Could not find the R36S defconfig."
             echo
-            echo "Available configs:"
-            find arch/arm64/configs -maxdepth 1 -type f -printf '%f\n' | sort
+            echo "Available ARM64 defconfigs:"
+            find arch/arm64/configs \
+              -maxdepth 1 \
+              -type f \
+              -name '*defconfig' \
+              -printf '%f\n' | sort
             exit 1
           fi
 
           echo "Using defconfig: $DEFCONFIG"
           echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
 
-      - name: Create PPP/PPTP configuration fragment
+      - name: Load base defconfig
         working-directory: kernel
         run: |
-          cat > r36s-ppp.config <<'EOF'
-          #
-          # R36S PPP / PPTP support
-          #
+          set -e
+          make ARCH=arm64 "$DEFCONFIG"
 
+      - name: Create all network and USB driver configuration
+        working-directory: kernel
+        run: |
+          set -e
+
+          : > all-network-usb.config
+
+          for dir in \
+            drivers/net \
+            drivers/usb
+          do
+            [ -d "$dir" ] || continue
+
+            find "$dir" \
+              -type f \
+              \( -name 'Kconfig' -o -name 'Kconfig.*' \) \
+              -print0 |
+            while IFS= read -r -d '' kconfig; do
+              grep -hE \
+                '^[[:space:]]*config[[:space:]]+[A-Za-z0-9_]+' \
+                "$kconfig" || true
+            done |
+            sed -E \
+              's/^[[:space:]]*config[[:space:]]+//' |
+            sed -E \
+              's/[[:space:]].*$//' |
+            sort -u |
+            while IFS= read -r symbol; do
+              [ -n "$symbol" ] || continue
+              printf 'CONFIG_%s=y\n' "$symbol"
+            done >> all-network-usb.config
+          done
+
+          cat >> all-network-usb.config <<'EOF'
+
+          # Core networking
+          CONFIG_NET=y
+          CONFIG_PACKET=y
+          CONFIG_UNIX=y
+          CONFIG_INET=y
+          CONFIG_NETDEVICES=y
+          CONFIG_ETHERNET=y
+          CONFIG_WIRELESS=y
+          CONFIG_CFG80211=y
+          CONFIG_MAC80211=y
+
+          # USB networking
+          CONFIG_USB_NET_DRIVERS=y
+          CONFIG_USB_USBNET=y
+          CONFIG_USB_NET_CDCETHER=y
+          CONFIG_USB_NET_CDC_EEM=y
+          CONFIG_USB_NET_CDC_NCM=y
+          CONFIG_USB_NET_RNDIS_HOST=y
+          CONFIG_USB_NET_CDC_SUBSET=y
+          CONFIG_USB_NET_RNDIS_WLAN=y
+
+          # PPP / PPTP
           CONFIG_PPP=y
           CONFIG_PPP_BSDCOMP=y
           CONFIG_PPP_DEFLATE=y
@@ -106,82 +166,104 @@ jobs:
           CONFIG_PPP_SYNC_TTY=y
           EOF
 
-          cat r36s-ppp.config
+          sort -u \
+            all-network-usb.config \
+            -o all-network-usb.config
 
-      - name: Generate base kernel configuration
-        working-directory: kernel
-        run: |
-          make ARCH=arm64 "$DEFCONFIG"
+          echo "Generated configuration entries:"
+          wc -l all-network-usb.config
 
-      - name: Apply PPP/PPTP configuration
-        working-directory: kernel
-        run: |
-          ./scripts/kconfig/merge_config.sh \
-            -m \
-            .config \
-            r36s-ppp.config
-
-          echo
-          echo "Regenerating configuration..."
-          make ARCH=arm64 olddefconfig
-
-      - name: Verify PPP/PPTP configuration
+      - name: Merge network and USB configuration
         working-directory: kernel
         run: |
           set -e
 
-          echo "Checking final .config..."
+          ./scripts/kconfig/merge_config.sh \
+            -m \
+            .config \
+            all-network-usb.config
+
+          make ARCH=arm64 olddefconfig
+
+      - name: Display final configuration
+        working-directory: kernel
+        run: |
+          echo "========================================"
+          echo "NETWORK / ETHERNET / WIFI / PPP"
+          echo "========================================"
+
+          grep -E \
+            '^CONFIG_(NET|NETDEVICES|ETHERNET|PHY|WIRELESS|WLAN|CFG80211|MAC80211|PPP|PPPOE|PPTP|PPPOL2TP|USB_NET|USB_USBNET)' \
+            .config || true
+
           echo
+          echo "========================================"
+          echo "USB"
+          echo "========================================"
 
-          REQUIRED_CONFIGS="
-          CONFIG_PPP=y
-          CONFIG_PPP_BSDCOMP=y
-          CONFIG_PPP_DEFLATE=y
-          CONFIG_PPP_FILTER=y
-          CONFIG_PPP_MPPE=y
-          CONFIG_PPP_MULTILINK=y
-          CONFIG_PPPOE=y
-          CONFIG_PPTP=y
-          CONFIG_PPPOL2TP=y
-          CONFIG_PPP_ASYNC=y
-          CONFIG_PPP_SYNC_TTY=y
-          "
+          grep -E '^CONFIG_USB_' .config || true
 
-          FAILED=0
+      - name: Verify required options
+        working-directory: kernel
+        run: |
+          set -e
 
-          while IFS= read -r CONFIG; do
-            [ -z "$CONFIG" ] && continue
+          required=(
+            CONFIG_NET
+            CONFIG_NETDEVICES
+            CONFIG_ETHERNET
+            CONFIG_WIRELESS
+            CONFIG_CFG80211
+            CONFIG_MAC80211
+            CONFIG_USB_SUPPORT
+            CONFIG_USB_NET_DRIVERS
+            CONFIG_USB_USBNET
+            CONFIG_PPP
+            CONFIG_PPP_BSDCOMP
+            CONFIG_PPP_DEFLATE
+            CONFIG_PPP_FILTER
+            CONFIG_PPP_MPPE
+            CONFIG_PPP_MULTILINK
+            CONFIG_PPPOE
+            CONFIG_PPTP
+            CONFIG_PPPOL2TP
+            CONFIG_PPP_ASYNC
+            CONFIG_PPP_SYNC_TTY
+          )
 
-            if grep -qx "$CONFIG" .config; then
-              echo "OK: $CONFIG"
+          failed=0
+
+          for symbol in "${required[@]}"; do
+            if grep -qx "${symbol}=y" .config; then
+              echo "OK      ${symbol}=y"
             else
-              echo "FAILED: $CONFIG"
-              FAILED=1
+              echo "MISSING ${symbol}=y"
+              failed=1
             fi
-          done <<< "$REQUIRED_CONFIGS"
+          done
 
-          if [ "$FAILED" -ne 0 ]; then
+          if [ "$failed" -ne 0 ]; then
             echo
-            echo "One or more requested kernel options were not enabled."
-            echo
-            grep -E '^CONFIG_(PPP|PPPOE|PPTP|PPPOL2TP)' .config || true
+            echo "One or more required options could not be enabled"
+            echo "after Kconfig dependency resolution."
             exit 1
           fi
 
-          echo
-          echo "All requested PPP/PPTP options are enabled."
-
-      - name: Build kernel
+      - name: Build ARM64 kernel Image
         working-directory: kernel
         run: |
+          set -e
+
           make \
             -j"$(nproc)" \
             ARCH=arm64 \
             CROSS_COMPILE=aarch64-linux-gnu- \
             Image
 
-      - name: Collect build output
+      - name: Package kernel
         run: |
+          set -e
+
           mkdir -p output
 
           cp kernel/arch/arm64/boot/Image \
@@ -190,31 +272,24 @@ jobs:
           cp kernel/.config \
             output/r36s.config
 
-          cp kernel/r36s-ppp.config \
-            output/r36s-ppp.config
+          cp kernel/all-network-usb.config \
+            output/all-network-usb.config
 
-          echo "Build completed:"
-          ls -lh output/
-
-      - name: Upload kernel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: r36s-kernel-ppp-pptp
-          path: output/
-          if-no-files-found: error
-
-      - name: Create release package
-        run: |
           cd output
-          zip -9 ../r36s-kernel-ppp-pptp.zip \
+
+          zip -9 \
+            ../r36s-kernel-all-network-usb.zip \
             Image \
             r36s.config \
-            r36s-ppp.config
+            all-network-usb.config
 
-      - name: Upload ZIP artifact
+      - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: r36s-kernel-ppp-pptp-zip
-          path: r36s-kernel-ppp-pptp.zip
+          name: r36s-kernel-all-network-usb
+          path: |
+            output/Image
+            output/r36s.config
+            output/all-network-usb.config
+            r36s-kernel-all-network-usb.zip
           if-no-files-found: error
-```
