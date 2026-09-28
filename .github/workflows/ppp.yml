@@ -1,4 +1,4 @@
-name: Build R36S Kernel - All Network USB Drivers
+name: Build R36S Kernel - Network WiFi Ethernet USB
 
 on:
   workflow_dispatch:
@@ -49,12 +49,8 @@ jobs:
         run: |
           set -e
 
-          # The R36S kernel's fs/Kconfig and fs/Makefile reference
-          # fs/exfat, but the directory is missing from the repository.
-          #
-          # Use the exFAT backport branch intended for older kernels.
           if [ ! -f fs/exfat/Kconfig ]; then
-            echo "fs/exfat is missing; restoring a 4.1-5.15 compatible exFAT driver."
+            echo "fs/exfat is missing; restoring compatible exFAT driver."
 
             rm -rf /tmp/linux-exfat-oot
             git clone \
@@ -66,14 +62,11 @@ jobs:
 
             mkdir -p fs/exfat
             cp -a /tmp/linux-exfat-oot/. fs/exfat/
-
             rm -rf fs/exfat/.git
           fi
 
           test -f fs/exfat/Kconfig
           test -f fs/exfat/Makefile
-
-          echo "exFAT driver restored successfully."
 
       - name: Load R36S defconfig
         working-directory: kernel
@@ -81,15 +74,23 @@ jobs:
           set -e
           make ARCH=arm64 lineageos_r36s_defconfig
 
-      - name: Create all network and USB driver configuration
+      - name: Enable compatible network and USB drivers
         working-directory: kernel
         run: |
           set -e
 
-          : > all-network-usb.config
+          : > network-usb.config
 
+          # Enable driver Kconfig symbols in the network areas that contain
+          # Wi-Fi, USB Ethernet and normal Ethernet MAC drivers.
+          #
+          # Do NOT force drivers/net/phy or drivers/net/dsa. Those directories
+          # contain many optional PHY/switch drivers which are not required by
+          # the R36S and some are not compatible with this vendor 4.19 tree.
           for dir in \
-            drivers/net \
+            drivers/net/ethernet \
+            drivers/net/wireless \
+            drivers/net/usb \
             drivers/usb
           do
             [ -d "$dir" ] || continue
@@ -111,12 +112,12 @@ jobs:
             while IFS= read -r symbol; do
               [ -n "$symbol" ] || continue
               printf 'CONFIG_%s=y\n' "$symbol"
-            done >> all-network-usb.config
+            done >> network-usb.config
           done
 
-          cat >> all-network-usb.config <<'EOF'
+          cat >> network-usb.config <<'EOF'
 
-          # Core networking
+          # Networking core
           CONFIG_NET=y
           CONFIG_PACKET=y
           CONFIG_UNIX=y
@@ -127,19 +128,10 @@ jobs:
           CONFIG_WLAN=y
           CONFIG_CFG80211=y
           CONFIG_MAC80211=y
-          CONFIG_OF_NET=y
-          CONFIG_OF_MDIO=y
-          CONFIG_MDIO_DEVICE=y
-          CONFIG_MDIO_BUS=y
-          CONFIG_PHYLINK=y
-          CONFIG_PHYLIB=y
 
           # USB core
           CONFIG_USB_SUPPORT=y
           CONFIG_USB=y
-          CONFIG_USB_COMMON=y
-          CONFIG_USB_PHY=y
-          CONFIG_USB_GADGET=y
 
           # USB networking
           CONFIG_USB_NET_DRIVERS=y
@@ -148,7 +140,6 @@ jobs:
           CONFIG_USB_NET_CDC_EEM=y
           CONFIG_USB_NET_CDC_NCM=y
           CONFIG_USB_NET_RNDIS_HOST=y
-          CONFIG_USB_NET_CDC_SUBSET_ENABLE=y
           CONFIG_USB_NET_CDC_SUBSET=y
           CONFIG_USB_NET_RNDIS_WLAN=y
 
@@ -168,13 +159,15 @@ jobs:
           # exFAT
           CONFIG_EXFAT_FS=y
           CONFIG_EXFAT_DEFAULT_IOCHARSET="utf8"
+
+          # Known optional TI PHY not needed on R36S.
+          # The R36S base defconfig keeps PHY selection compatible with its MAC.
+          CONFIG_DP83867_PHY=n
           EOF
 
-          sort -u \
-            all-network-usb.config \
-            -o all-network-usb.config
+          sort -u network-usb.config -o network-usb.config
 
-          echo "Generated $(wc -l < all-network-usb.config) configuration entries."
+          echo "Generated $(wc -l < network-usb.config) configuration entries."
 
       - name: Merge network and USB configuration
         working-directory: kernel
@@ -184,27 +177,20 @@ jobs:
           ./scripts/kconfig/merge_config.sh \
             -m \
             .config \
-            all-network-usb.config
+            network-usb.config
 
           make ARCH=arm64 olddefconfig
 
-      - name: Display final configuration
+      - name: Show final important configuration
         working-directory: kernel
         run: |
           echo "========================================"
-          echo "NETWORK / ETHERNET / WIFI / PPP"
+          echo "NETWORK / WIFI / ETHERNET / USB"
           echo "========================================"
 
           grep -E \
-            '^CONFIG_(NET|NETDEVICES|ETHERNET|MDIO|PHY|WIRELESS|WLAN|CFG80211|MAC80211|PPP|PPPOE|PPTP|PPPOL2TP|USB_NET|USB_USBNET)' \
+            '^CONFIG_(NET|NETDEVICES|ETHERNET|WIRELESS|WLAN|CFG80211|MAC80211|USB_NET|USB_USBNET|PPP|PPPOE|PPTP|PPPOL2TP)' \
             .config || true
-
-          echo
-          echo "========================================"
-          echo "USB"
-          echo "========================================"
-
-          grep -E '^CONFIG_USB_' .config || true
 
           echo
           echo "========================================"
@@ -223,7 +209,6 @@ jobs:
             CONFIG_NETDEVICES
             CONFIG_ETHERNET
             CONFIG_WIRELESS
-            CONFIG_WLAN
             CONFIG_CFG80211
             CONFIG_MAC80211
             CONFIG_USB_SUPPORT
@@ -257,8 +242,7 @@ jobs:
 
           if [ "$failed" -ne 0 ]; then
             echo
-            echo "One or more required options could not be enabled"
-            echo "after Kconfig dependency resolution."
+            echo "One or more required options were disabled by Kconfig."
             exit 1
           fi
 
@@ -285,24 +269,24 @@ jobs:
           cp kernel/.config \
             output/r36s.config
 
-          cp kernel/all-network-usb.config \
-            output/all-network-usb.config
+          cp kernel/network-usb.config \
+            output/network-usb.config
 
           cd output
 
           zip -9 \
-            ../r36s-kernel-all-network-usb.zip \
+            ../r36s-kernel-network-usb.zip \
             Image \
             r36s.config \
-            all-network-usb.config
+            network-usb.config
 
       - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: r36s-kernel-all-network-usb
+          name: r36s-kernel-network-usb
           path: |
             output/Image
             output/r36s.config
-            output/all-network-usb.config
-            r36s-kernel-all-network-usb.zip
+            output/network-usb.config
+            r36s-kernel-network-usb.zip
           if-no-files-found: error
